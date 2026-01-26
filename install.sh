@@ -874,8 +874,15 @@ npm cache clean --force >/dev/null 2>&1 || true
 npm install --silent >/dev/null 2>&1 || true
 
 # Parche whatsapp-web.js (anti-markedUnread) – best-effort
+# 1) Ajuste simple (cuando existe la clave markedUnread)
 find node_modules/whatsapp-web.js -name "Client.js" -type f -exec \
   sed -i "s/markedUnread: true/markedUnread: false/g" {} \; 2>/dev/null || true
+# 2) Fallback defensivo (algunas versiones traen el if(chat && chat.markedUnread))
+find node_modules/whatsapp-web.js -name "Client.js" -type f -exec \
+  sed -i "s/if (chat && chat.markedUnread)/if (false \\&\\& chat.markedUnread)/g" {} \; 2>/dev/null || true
+# 3) Fallback extra (deshabilitar sendSeen si tu build lo usa y rompe por markedUnread)
+find node_modules/whatsapp-web.js -name "Client.js" -type f -exec \
+  sed -i "s/const sendSeen = async (chatId) => {/const sendSeen = async (chatId) => { console.log(\\"[DEBUG] sendSeen deshabilitado\\"); return; /g" {} \; 2>/dev/null || true
 
 # Auto-refresh cada 2 horas
 ( crontab -l 2>/dev/null | grep -v 'ssh-bot-refresh' ) | crontab - || true
@@ -1167,18 +1174,33 @@ mp_configurar_token() {
   curr="$(get_json '.mercadopago.access_token // empty')"
   clear
   echo -e "${CYAN}${BOLD}💳 MercadoPago – Token${NC}"
+  echo "----------------------------------------"
   if [[ -n "$curr" && "$curr" != "null" ]]; then
     echo "Actual: ${curr:0:12}********"
   else
     echo "Actual: (vacío)"
   fi
   echo
+  echo -e "${YELLOW}Formato válido:${NC} debe empezar con ${BOLD}APP_USR-${NC} (producción) o ${BOLD}TEST-${NC} (test)."
+  echo
   read -rp "Pegá el nuevo token (enter=cancelar): " tok
   [[ -z "$tok" ]] && { echo "Cancelado."; pausa; return; }
+
+  if [[ ! "$tok" =~ ^APP_USR- ]] && [[ ! "$tok" =~ ^TEST- ]]; then
+    echo -e "${RED}❌ Token inválido.${NC}"
+    echo -e "${YELLOW}Debe empezar con APP_USR- o TEST-${NC}"
+    pausa
+    return
+  fi
+
   set_json ".mercadopago.access_token = \"$tok\" | .mercadopago.enabled = true"
   echo -e "${GREEN}✅ Token guardado.${NC}"
+  echo -e "${YELLOW}🔄 Reiniciando bot para aplicar...${NC}"
+  pm2 restart "$BOT_NAME" >/dev/null 2>&1 || true
+  pm2 save >/dev/null 2>&1 || true
   pausa
 }
+
 
 # ---------- PRECIOS ----------
 cambiar_precios() {
