@@ -81,8 +81,13 @@ apt-get install -y -qq \
   ca-certificates gnupg \
   software-properties-common \
   libgbm-dev libxshmfence-dev \
-  sshpass at \
-  qrencode chafa viu || true
+  sshpass at >/dev/null 2>&1 || true
+
+# Extras (no romper si no existen en el repo)
+apt-get install -y -qq qrencode chafa >/dev/null 2>&1 || true
+if apt-cache show viu >/dev/null 2>&1; then
+  apt-get install -y -qq viu >/dev/null 2>&1 || true
+fi
 
 systemctl enable atd >/dev/null 2>&1 || true
 systemctl start atd >/dev/null 2>&1 || true
@@ -1165,8 +1170,6 @@ ver_qr() {
   done
 }
 
-}
-
 # ---------- MERCADOPAGO ----------
 mp_configurar_token() {
   ensure_config
@@ -1739,3 +1742,4 @@ echo -e "${GREEN}${BOLD}✅ Instalación EMBED completada.${NC}"
 echo -e "${CYAN}👉 Panel: ${BOLD}sshbot${NC}"
 echo -e "${CYAN}👉 QR: en panel opción [2] (borra sesión + fuerza QR nuevo)${NC}"
 echo
+
