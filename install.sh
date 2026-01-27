@@ -65,6 +65,11 @@ echo -e "   ✅ 📲 Gestión APK (subir/borrar/listar)"
 echo -e "   ✅ 👥 Gestión usuarios: eliminar / eliminar expirados / conectados"
 echo -e "   ✅ 📊 Estadísticas: ventas + ganancias"
 echo -e "   ✅ 🔄 Auto-refresh PM2 cada 2 horas + Update desde panel (anti-cuelgue)"
+echo -e "   ✅ 🧠 IA Gemini (opcional): soporte automático + fallback al menú"
+echo -e "   ✅ 🧾 Menú cliente restaurado: responde a \"menu\" (y detecta textos mal escritos)"
+echo -e "   ✅ 📲 APK: importar desde /root + descargar por URL (ambas opciones)"
+echo -e "   ✅ 🌐 Custom/HTTP: mensaje + URL editables desde panel (para el cliente)"
+echo -e "   ✅ 🆘 Soporte/Tutorial: WhatsApp + Telegram + links editables desde panel"
 echo -e "   ✅ 📱 QR FIX: Vincular WhatsApp desde panel (TXT/PNG)"
 echo
 read -rp "$(echo -e "${YELLOW}¿Continuar? (s/N): ${NC}")" -n 1 -r
@@ -1136,6 +1141,52 @@ NC='\033[0m'
 need_cmd() { command -v "$1" >/dev/null 2>&1; }
 pausa(){ read -rp "Presioná ENTER para continuar..." _ || true; }
 
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
+
+PM2_BIN=""
+pm2_resolve(){ PM2_BIN="$(command -v pm2 2>/dev/null || true)"; }
+pm2_run(){
+  pm2_resolve
+  if [[ -n "${PM2_BIN}" ]]; then
+    "${PM2_BIN}" "$@"
+    return $?
+  fi
+  echo -e "${RED}❌ pm2 no está instalado o no está en PATH.${NC}"
+  echo -e "${YELLOW}➡️ Solución: ejecutá en la VPS:${NC}"
+  echo -e "   npm i -g pm2  ${YELLOW}(o rerun del instalador)${NC}"
+  return 127
+}
+
+ensure_runtime(){
+  # Instala deps mínimas del panel si faltan (no rompe si ya existen)
+  local pkgs=()
+  for c in jq sqlite3 curl wget; do
+    command -v "$c" >/dev/null 2>&1 || pkgs+=("$c")
+  done
+
+  if [[ ${#pkgs[@]} -gt 0 ]]; then
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -y >/dev/null 2>&1 || true
+    apt-get install -y "${pkgs[@]}" >/dev/null 2>&1 || true
+  fi
+
+  # Asegurar pm2
+  if ! command -v pm2 >/dev/null 2>&1; then
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -y >/dev/null 2>&1 || true
+
+    if ! command -v npm >/dev/null 2>&1; then
+      # Node 20 + npm
+      curl -fsSL https://deb.nodesource.com/setup_20.x | bash - >/dev/null 2>&1 || true
+      apt-get install -y nodejs >/dev/null 2>&1 || true
+    fi
+
+    npm i -g pm2 >/dev/null 2>&1 || true
+    hash -r 2>/dev/null || true
+  fi
+
+  pm2_resolve
+}
 require_root() {
   if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
     echo -e "${RED}❌ Ejecutar como root${NC}"
@@ -1251,9 +1302,10 @@ ensure_db() {
 }
 
 pm2_status() {
-  if ! need_cmd pm2; then echo "OFF"; return; fi
+  pm2_resolve
+  if [[ -z "${PM2_BIN}" ]]; then echo "OFF"; return; fi
   local st
-  st="$(pm2 jlist 2>/dev/null | jq -r '.[]|select(.name=="'"$BOT_NAME"'")|.pm2_env.status' | head -n1)"
+  st="$(pm2_run jlist 2>/dev/null | jq -r '.[]|select(.name=="'"$BOT_NAME"'")|.pm2_env.status' | head -n1)"
   [[ -z "$st" || "$st" == "null" ]] && st="OFF"
   echo "$st"
 }
@@ -1305,9 +1357,9 @@ bot_control_menu() {
     echo "[0] Volver"
     read -rp "Opción: " o
     case "$o" in
-      1) if pm2 describe "$BOT_NAME" >/dev/null 2>&1; then pm2 restart "$BOT_NAME" >/dev/null 2>&1 || true; else pm2 start "$BOT_HOME/bot.js" --name "$BOT_NAME" --cwd "$BOT_HOME" >/dev/null 2>&1 || true; fi; pm2 save >/dev/null 2>&1 || true; echo "OK"; pausa ;;
-      2) pm2 stop "$BOT_NAME" >/dev/null 2>&1 || true; pm2 save >/dev/null 2>&1 || true; echo "OK"; pausa ;;
-      3) pm2 logs "$BOT_NAME" --lines 220; pausa ;;
+      1) if pm2_run describe "$BOT_NAME" >/dev/null 2>&1; then pm2_run restart "$BOT_NAME" >/dev/null 2>&1 || true; else pm2_run start "$BOT_HOME/bot.js" --name "$BOT_NAME" --cwd "$BOT_HOME" >/dev/null 2>&1 || true; fi; pm2_run save >/dev/null 2>&1 || true; echo "OK"; pausa ;;
+      2) pm2_run stop "$BOT_NAME" >/dev/null 2>&1 || true; pm2_run save >/dev/null 2>&1 || true; echo "OK"; pausa ;;
+      3) pm2_run logs "$BOT_NAME" --lines 220; pausa ;;
       0) return ;;
       *) echo "Inválido"; sleep 1 ;;
     esac
@@ -1328,7 +1380,7 @@ show_qr_console() {
     echo
     return 0
   fi
-  pm2 logs "$BOT_NAME" --lines 260 --nostream 2>/dev/null | tail -n 260 || true
+  pm2_run logs "$BOT_NAME" --lines 260 --nostream 2>/dev/null | tail -n 260 || true
 }
 
 show_qr_png() {
@@ -1373,12 +1425,12 @@ ver_qr() {
         echo
         reset_whatsapp_session
         echo -e "${CYAN}🔁 Reiniciando bot...${NC}"
-        if pm2 describe "$BOT_NAME" >/dev/null 2>&1; then
-          pm2 restart "$BOT_NAME" >/dev/null 2>&1 || true
+        if pm2_run describe "$BOT_NAME" >/dev/null 2>&1; then
+          pm2_run restart "$BOT_NAME" >/dev/null 2>&1 || true
         else
-          pm2 start "$BOT_HOME/bot.js" --name "$BOT_NAME" --cwd "$BOT_HOME" >/dev/null 2>&1 || true
+          pm2_run start "$BOT_HOME/bot.js" --name "$BOT_NAME" --cwd "$BOT_HOME" >/dev/null 2>&1 || true
         fi
-        pm2 save >/dev/null 2>&1 || true
+        pm2_run save >/dev/null 2>&1 || true
 
         echo -e "${CYAN}⏳ Esperando QR (hasta 45s)...${NC}"
         for i in {1..45}; do
@@ -1394,7 +1446,7 @@ ver_qr() {
         pausa
         ;;
       3)
-        pm2 logs "$BOT_NAME" --lines 220
+        pm2_run logs "$BOT_NAME" --lines 220
         pausa
         ;;
       0) return ;;
@@ -1432,8 +1484,8 @@ mp_configurar_token() {
   set_json ".mercadopago.access_token = \"$tok\" | .mercadopago.enabled = true"
   echo -e "${GREEN}✅ Token guardado.${NC}"
   echo -e "${YELLOW}🔄 Reiniciando bot para aplicar...${NC}"
-  pm2 restart "$BOT_NAME" >/dev/null 2>&1 || true
-  pm2 save >/dev/null 2>&1 || true
+  pm2_run restart "$BOT_NAME" >/dev/null 2>&1 || true
+  pm2_run save >/dev/null 2>&1 || true
   pausa
 }
 
@@ -1509,7 +1561,7 @@ apk_menu() {
           echo "No encontré .apk en /root."
           echo "Tip: subí tu APK a /root/app.apk"
           pausa
-          ;;
+          continue
         fi
         echo
         echo "APKs encontrados en /root:"
@@ -1521,11 +1573,11 @@ apk_menu() {
         done
         echo
         read -rp "Elegí número para copiar a $APK_DIR (0=cancelar): " sel
-        [[ -z "$sel" || "$sel" == "0" ]] && { echo "Cancelado."; pausa; ;; }
+        [[ -z "$sel" || "$sel" == "0" ]] && { echo "Cancelado."; pausa; continue; }
         if ! [[ "$sel" =~ ^[0-9]+$ ]] || (( sel < 1 || sel > ${#found[@]} )); then
           echo "Inválido."
           pausa
-          ;;
+          continue
         fi
         src_apk="${found[$((sel-1))]}"
         base="$(basename "$src_apk")"
@@ -1949,12 +2001,12 @@ update_menu() {
   echo -e "${CYAN}➡️ npm install...${NC}"
   (cd "$BOT_HOME" && npm install --silent) || true
   echo -e "${CYAN}➡️ restart PM2...${NC}"
-  if pm2 describe "$BOT_NAME" >/dev/null 2>&1; then
-    pm2 restart "$BOT_NAME" >/dev/null 2>&1 || true
+  if pm2_run describe "$BOT_NAME" >/dev/null 2>&1; then
+    pm2_run restart "$BOT_NAME" >/dev/null 2>&1 || true
   else
-    pm2 start "$BOT_HOME/bot.js" --name "$BOT_NAME" --cwd "$BOT_HOME" >/dev/null 2>&1 || true
+    pm2_run start "$BOT_HOME/bot.js" --name "$BOT_NAME" --cwd "$BOT_HOME" >/dev/null 2>&1 || true
   fi
-  pm2 save >/dev/null 2>&1 || true
+  pm2_run save >/dev/null 2>&1 || true
   echo -e "${GREEN}✅ Update OK.${NC}"
   pausa
 }
@@ -2095,6 +2147,7 @@ main_menu() {
   ensure_dirs
   ensure_config
   ensure_db
+  ensure_runtime
 
   while true; do
     clear
