@@ -121,7 +121,18 @@ if [[ ! -s "$CONFIG_FILE" ]]; then
   "admins": [],
   "prices": { "test_hours": 2, "plan_7": 500, "plan_15": 800, "plan_30": 1200, "currency": "ARS" },
   "mercadopago": { "access_token": "", "enabled": false },
-  "gemini": { "enabled": false, "api_key": "" }
+  "gemini": { "enabled": false, "api_key": "" },
+  "links": {
+    "tutorial": "https://youtube.com",
+    "support": "https://t.me/soporte",
+    "support_whatsapp": "",
+    "telegram": ""
+  },
+  "downloads": {
+    "apk_url": "",
+    "custom_url": "",
+    "custom_message": "📲 *HTTP Custom*\n\n⬇️ Descargá desde:\n{URL}\n\nLuego importá tu archivo .hc (HWID) y conectá."
+  }
 }
 EOF
   chmod 600 "$CONFIG_FILE" >/dev/null 2>&1 || true
@@ -195,7 +206,7 @@ const axios = require("axios").default;
 const qrcode = require("qrcode");
 const qrcodeTerminal = require("qrcode-terminal");
 
-const { Client, LocalAuth } = require("whatsapp-web.js");
+const { Client, LocalAuth, MessageMedia } = require("whatsapp-web.js");
 
 const ROOT = "/root";
 const INSTALL_DIR = "/opt/ssh-bot";
@@ -223,7 +234,13 @@ function loadConfig() {
   return { config: {}, path: "" };
 }
 
-const { config, path: configPath } = loadConfig();
+let { config, path: configPath } = loadConfig();
+
+function reloadConfig() {
+  const r = loadConfig();
+  config = r.config || {};
+  configPath = r.path || configPath;
+}
 
 function cfg(pathExpr, fallback) {
   try {
@@ -251,6 +268,95 @@ const PRICE_7 = Number(cfg("prices.plan_7", 0));
 const PRICE_15 = Number(cfg("prices.plan_15", 0));
 const PRICE_30 = Number(cfg("prices.plan_30", 0));
 const CURRENCY = cfg("prices.currency", "ARS");
+
+function linksCfg() {
+  return {
+    support: cfg("links.support", "https://t.me/soporte"),
+    support_whatsapp: cfg("links.support_whatsapp", ""),
+    telegram: cfg("links.telegram", ""),
+    tutorial: cfg("links.tutorial", "https://youtube.com"),
+  };
+}
+
+function downloadsCfg() {
+  return {
+    apk_url: cfg("downloads.apk_url", ""),
+    custom_url: cfg("downloads.custom_url", ""),
+    custom_message: cfg("downloads.custom_message", "📲 *HTTP Custom*\n\n⬇️ Descargá desde:\n{URL}\n\nLuego importá tu archivo .hc (HWID) y conectá."),
+  };
+}
+
+function geminiCfg() {
+  return {
+    enabled: !!cfg("gemini.enabled", false),
+    api_key: cfg("gemini.api_key", ""),
+  };
+}
+
+async function geminiSupportReply(userText) {
+  try {
+    const g = geminiCfg();
+    if (!g.enabled || !g.api_key) return null;
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key=${g.api_key}`;
+    const payload = {
+      contents: [{
+        parts: [{
+          text:
+`Eres soporte técnico de un servicio SSH/VPN.
+Responde claro, profesional y breve.
+Ayuda a diagnosticar errores comunes de conexión.
+Usa emojis moderados.
+Si el usuario pide el menú, decile que escriba "menu".
+
+Consulta del usuario:
+"${userText}"`
+        }]
+      }]
+    };
+    const resp = await axios.post(url, payload, { timeout: 15000 });
+    const out = resp?.data?.candidates?.[0]?.content?.parts?.[0]?.text;
+    return out ? String(out).trim() : null;
+  } catch (e) {
+    log(`Gemini error: ${e.message}`);
+    return null;
+  }
+}
+
+function menuText() {
+  return `🤖 *${BOT_NAME}* (${BOT_VERSION})\n\n` +
+    `1️⃣ 🆓 Prueba GRATIS (${TEST_HOURS}h)\n` +
+    `2️⃣ 💳 Planes Premium (7/15/30)\n` +
+    `3️⃣ 👤 Mis cuentas\n` +
+    `4️⃣ 💳 Estado de pago\n` +
+    `5️⃣ 📲 Descargar app / Custom\n` +
+    `6️⃣ 🆘 Soporte\n\n` +
+    `💬 Responde con el número o escribí *comprar* para comprar.`;
+}
+
+function premiumMenuText() {
+  return `💎 *PLANES PREMIUM*\n\n` +
+    `1️⃣ 7 días  - $${PRICE_7} ${CURRENCY}\n` +
+    `2️⃣ 15 días - $${PRICE_15} ${CURRENCY}\n` +
+    `3️⃣ 30 días - $${PRICE_30} ${CURRENCY}\n\n` +
+    `💬 Responde 1/2/3`;
+}
+
+function supportText() {
+  const l = linksCfg();
+  const parts = [];
+  if (l.support_whatsapp) parts.push(`📱 WhatsApp: ${l.support_whatsapp}`);
+  if (l.telegram) parts.push(`✈️ Telegram: ${l.telegram}`);
+  if (l.support) parts.push(`🔗 Soporte: ${l.support}`);
+  if (l.tutorial) parts.push(`📺 Tutorial: ${l.tutorial}`);
+  return `🆘 *SOPORTE*\n\n${parts.join("\n")}\n\n💬 Si querés, escribí tu problema y te responde la IA (si está activada).`;
+}
+
+function customDownloadText() {
+  const d = downloadsCfg();
+  const url = d.custom_url || "(sin URL configurada)";
+  const msg = (d.custom_message || "").replace(/\{URL\}/g, url);
+  return msg;
+}
 
 const ADMIN_NUMBERS = (cfg("admins", []) || [])
   .map(s => String(s).replace(/\D/g, ""))
@@ -632,6 +738,87 @@ async function handleMessage(client, msg) {
   const lower = text.toLowerCase();
   const isAdmin = isAdminNumber(phone);
 
+
+  // Reload config (so panel edits apply without reinstall; restart still recommended)
+  reloadConfig();
+
+  // Quick menu
+  if (lower === "menu" || lower === "start" || lower === "inicio" || lower === "hola" || lower === "hi") {
+    resetSession(phone);
+    return client.sendMessage(msg.from, menuText());
+  }
+
+  // Session handling
+  const s = sessionGet(phone);
+
+  // Menu numeric shortcuts (when not already in flow)
+  if (!s.step || s.step === "idle") {
+    if (lower === "1") { s.step = "choose_app"; s.plan = "test"; s.app = null; return client.sendMessage(msg.from, appMenuText()); }
+    if (lower === "2") { s.step = "choose_premium_plan"; s.plan = null; s.app = null; return client.sendMessage(msg.from, premiumMenuText()); }
+    if (lower === "3") {
+      const rows = await dbAll("SELECT username, password, tipo, expires_at, app_type, hwid FROM users WHERE phone=? ORDER BY id DESC LIMIT 5", [phone]);
+      const toks = await dbAll("SELECT token, plan, expires_at, status FROM tokens WHERE phone=? ORDER BY id DESC LIMIT 5", [phone]);
+      if ((!rows || rows.length===0) && (!toks || toks.length===0)) {
+        return client.sendMessage(msg.from, "📭 No tenés cuentas registradas.\n\nEscribí *menu* o *comprar*.");
+      }
+      let out = "👤 *MIS CUENTAS*\n\n";
+      if (rows && rows.length) {
+        for (const r of rows) {
+          out += `✅ Usuario: *${r.username}*\n🔐 Pass: *${r.password}*\n📦 Tipo: *${r.tipo || ""}*\n📅 Expira: *${r.expires_at || "∞"}*\n🧩 App: *${r.app_type || "-"}*\n`;
+          if (r.hwid) out += `🆔 HWID: *${r.hwid}*\n`;
+          out += "----------------------\n";
+        }
+      }
+      if (toks && toks.length) {
+        out += "\n🔑 *TOKENS*\n";
+        for (const t of toks) {
+          out += `• ${t.token}  (${t.plan})  expira: ${t.expires_at || "∞"}  [${t.status}]\n`;
+        }
+      }
+      return client.sendMessage(msg.from, out);
+    }
+    if (lower === "4") {
+      const pays = await dbAll("SELECT external_reference, status, plan, app_type, amount, currency, created_at FROM payments WHERE phone=? ORDER BY id DESC LIMIT 5", [phone]);
+      if (!pays || !pays.length) return client.sendMessage(msg.from, "💳 No tengo pagos registrados.\n\nEscribí *comprar* para generar uno.");
+      let out = "💳 *ESTADO DE PAGOS*\n\n";
+      for (const p of pays) {
+        out += `${p.status === "approved" ? "✅" : "⏳"} *${p.status.toUpperCase()}*\n`;
+        out += `Plan: ${p.plan || "-"} | Tipo: ${p.app_type || "-"} | $${p.amount || 0} ${p.currency || CURRENCY}\n`;
+        out += `Ref: ${p.external_reference}\n`;
+        out += `Fecha: ${p.created_at || ""}\n`;
+        out += "----------------------\n";
+      }
+      out += `\n🔎 Para verificar manual: *verificar <REF>*`;
+      return client.sendMessage(msg.from, out);
+    }
+    if (lower === "5") {
+      // APK / Custom download info
+      const d = downloadsCfg();
+      let out = "📲 *DESCARGAS*\n\n";
+      // Try send latest APK in BOT_HOME/apks
+      try {
+        const apkDir = path.join(BOT_HOME, "apks");
+        const files = fs.existsSync(apkDir) ? fs.readdirSync(apkDir).filter(f=>f.toLowerCase().endsWith(".apk")) : [];
+        if (files.length) {
+          files.sort((a,b)=>fs.statSync(path.join(apkDir,b)).mtimeMs - fs.statSync(path.join(apkDir,a)).mtimeMs);
+          const fp = path.join(apkDir, files[0]);
+          const st = fs.statSync(fp);
+          out += `✅ APK disponible: *${files[0]}* (${(st.size/1024/1024).toFixed(2)} MB)\n`;
+          out += "Si WhatsApp permite, te la envío ahora...\n";
+          const media = MessageMedia.fromFilePath(fp);
+          await client.sendMessage(msg.from, media, { caption: `📲 APK: ${files[0]}` });
+          return;
+        }
+      } catch (_) {}
+      if (d.apk_url) out += `🔗 APK URL: ${d.apk_url}\n\n`;
+      out += `🧩 *HTTP Custom*\n${customDownloadText()}\n`;
+      return client.sendMessage(msg.from, out);
+    }
+    if (lower === "6" || lower === "soporte") {
+      return client.sendMessage(msg.from, supportText());
+    }
+  }
+
   if (lower === "ayuda" || lower === "help" || lower === "!help" || lower === "/help") {
     return client.sendMessage(msg.from, helpText(isAdmin));
   }
@@ -664,14 +851,19 @@ async function handleMessage(client, msg) {
       const days = plan === "7" ? 7 : plan === "15" ? 15 : plan === "30" ? 30 : 1;
       const t = await createToken(phone, plan, days);
       return client.sendMessage(msg.from,
-        `✅ Pago aprobado.\n🔑 *Token*: ${t.token}\n📅 Expira: ${t.expires_at || "∞"}`
+        `✅ Pago aprobado.\n🔑 *Token*: ${t.token}\n📅 Expira: ${t.expires_at || "∞"}\n\n📌 Escribí *menu* para ver opciones.`
       );
     }
 
     const u = await createDbUser(phone, plan, appType);
     let extra = "";
+    if (appType === "apk") {
+      const d = downloadsCfg();
+      if (d.apk_url) extra = "\n\n📲 Descarga APK: " + d.apk_url;
+      else extra = "\n\n📲 Escribí *5* para descargar la app.";
+    }
     if (appType === "hc") {
-      extra = "\n🆔 Enviá tu *HWID* para activar (formato texto).";
+      extra = "\n🆔 Enviá tu *HWID* para activar (formato texto).\n\n" + customDownloadText();
     }
     return client.sendMessage(msg.from,
       `✅ Pago aprobado.\n👤 *Usuario*: ${u.username}\n🔐 *Pass*: ${u.password}\n📅 Expira: ${u.expires_at || "∞"}${extra}`
@@ -707,8 +899,17 @@ async function handleMessage(client, msg) {
     return client.sendMessage(msg.from, buyMenuText());
   }
 
-  // Session handling
-  const s = sessionGet(phone);
+  if (s.step === "choose_premium_plan") {
+    const v = String(text).trim();
+    let plan = null;
+    if (v === "1") plan = "7";
+    else if (v === "2") plan = "15";
+    else if (v === "3") plan = "30";
+    if (!plan) return client.sendMessage(msg.from, "Elegí: 1/2/3");
+    s.plan = plan;
+    s.step = "choose_app";
+    return client.sendMessage(msg.from, appMenuText());
+  }
 
   if (s.step === "choose_plan") {
     const plan = mapPlanChoice(text);
@@ -729,13 +930,13 @@ async function handleMessage(client, msg) {
         const t = await createToken(phone, "test", 1);
         resetSession(phone);
         return client.sendMessage(msg.from,
-          `✅ *Test ${TEST_HOURS}h* listo.\n🔑 Token: ${t.token}\n📅 Expira: ${t.expires_at || "∞"}`
+          `✅ *Test ${TEST_HOURS}h* listo.\n🔑 Token: ${t.token}\n📅 Expira: ${t.expires_at || "∞"}\n\n📌 Escribí *menu* para ver opciones.`
         );
       } else {
         const u = await createDbUser(phone, "test", app);
         resetSession(phone);
         return client.sendMessage(msg.from,
-          `✅ *Test ${TEST_HOURS}h* listo.\n👤 Usuario: ${u.username}\n🔐 Pass: ${u.password}\n📅 Expira: ${u.expires_at || "∞"}`
+          `✅ *Test ${TEST_HOURS}h* listo.\n👤 Usuario: ${u.username}\n🔐 Pass: ${u.password}\n📅 Expira: ${u.expires_at || "∞"}` + (app === "hc" ? ("\n\n🆔 Enviá tu *HWID* para activar.\n\n" + customDownloadText()) : (app === "apk" ? (downloadsCfg().apk_url ? ("\n\n📲 Descarga APK: " + downloadsCfg().apk_url) : "\n\n📲 Escribí *5* para descargar la app.") : ""))
         );
       }
     }
@@ -956,6 +1157,27 @@ set_json() {
   jq "$filter" "$CONFIG_FILE" > "$tmp" && mv "$tmp" "$CONFIG_FILE"
   chmod 600 "$CONFIG_FILE" || true
   cp -f "$CONFIG_FILE" "$BOT_HOME/config/config.json" >/dev/null 2>&1 || true
+  # Upgrade/migrate config (add missing keys without overwriting existing values)
+  set_json '(
+    .bot.name //= "SSH BOT ELNENE PRO" |
+    .bot.version //= "8.8.27" |
+    .prices.test_hours //= 2 |
+    .prices.plan_7 //= 500 |
+    .prices.plan_15 //= 800 |
+    .prices.plan_30 //= 1200 |
+    .prices.currency //= "ARS" |
+    .mercadopago //= {"access_token":"","enabled":false} |
+    .gemini //= {"enabled":false,"api_key":""} |
+    .links //= {"tutorial":"https://youtube.com","support":"https://t.me/soporte","support_whatsapp":"","telegram":""} |
+    .links.tutorial //= "https://youtube.com" |
+    .links.support //= "https://t.me/soporte" |
+    .links.support_whatsapp //= "" |
+    .links.telegram //= "" |
+    .downloads //= {"apk_url":"","custom_url":"","custom_message":"📲 *HTTP Custom*\\n\\n⬇️ Descargá desde:\\n{URL}\\n\\nLuego importá tu archivo .hc (HWID) y conectá."} |
+    .downloads.apk_url //= "" |
+    .downloads.custom_url //= "" |
+    .downloads.custom_message //= "📲 *HTTP Custom*\\n\\n⬇️ Descargá desde:\\n{URL}\\n\\nLuego importá tu archivo .hc (HWID) y conectá."
+  )'
 }
 
 ensure_config() {
@@ -967,7 +1189,18 @@ ensure_config() {
   "admins": [],
   "prices": { "test_hours": 2, "plan_7": 500, "plan_15": 800, "plan_30": 1200, "currency": "ARS" },
   "mercadopago": { "access_token": "", "enabled": false },
-  "gemini": { "enabled": false, "api_key": "" }
+  "gemini": { "enabled": false, "api_key": "" },
+  "links": {
+    "tutorial": "https://youtube.com",
+    "support": "https://t.me/soporte",
+    "support_whatsapp": "",
+    "telegram": ""
+  },
+  "downloads": {
+    "apk_url": "",
+    "custom_url": "",
+    "custom_message": "📲 *HTTP Custom*\n\n⬇️ Descargá desde:\n{URL}\n\nLuego importá tu archivo .hc (HWID) y conectá."
+  }
 }
 JSON
     chmod 600 "$CONFIG_FILE" || true
@@ -1237,6 +1470,7 @@ apk_menu() {
     echo -e "${CYAN}${BOLD}📲 Gestión APK${NC}"
     echo "[1] Listar APK"
     echo "[2] Subir APK (descargar por URL)"
+    echo "[4] Importar APK desde /root (copiar)"
     echo "[3] Borrar APK"
     echo "[0] Volver"
     read -rp "Opción: " o
@@ -1266,6 +1500,43 @@ apk_menu() {
         [[ -z "$name" ]] && { echo "Cancelado."; pausa; continue; }
         rm -f "$APK_DIR/$name" >/dev/null 2>&1 || true
         echo "OK"
+        pausa
+        ;;
+      4)
+        # Importar APK desde /root (copiar a $APK_DIR)
+        mapfile -t found < <(find /root -maxdepth 2 -type f -name "*.apk" 2>/dev/null | sort -r)
+        if [[ "${#found[@]}" -eq 0 ]]; then
+          echo "No encontré .apk en /root."
+          echo "Tip: subí tu APK a /root/app.apk"
+          pausa
+          ;;
+        fi
+        echo
+        echo "APKs encontrados en /root:"
+        local idx=1
+        for f in "${found[@]}"; do
+          local sz; sz="$(du -h "$f" 2>/dev/null | awk '{print $1}')"
+          echo "  [$idx] $f  ($sz)"
+          idx=$((idx+1))
+        done
+        echo
+        read -rp "Elegí número para copiar a $APK_DIR (0=cancelar): " sel
+        [[ -z "$sel" || "$sel" == "0" ]] && { echo "Cancelado."; pausa; ;; }
+        if ! [[ "$sel" =~ ^[0-9]+$ ]] || (( sel < 1 || sel > ${#found[@]} )); then
+          echo "Inválido."
+          pausa
+          ;;
+        fi
+        src_apk="${found[$((sel-1))]}"
+        base="$(basename "$src_apk")"
+        cp -f "$src_apk" "$APK_DIR/$base" >/dev/null 2>&1 || true
+        if [[ -s "$APK_DIR/$base" ]]; then
+          chmod 644 "$APK_DIR/$base" >/dev/null 2>&1 || true
+          echo -e "${GREEN}✅ Importado: $APK_DIR/$base${NC}"
+        else
+          rm -f "$APK_DIR/$base" >/dev/null 2>&1 || true
+          echo -e "${RED}❌ No pude copiar.${NC}"
+        fi
         pausa
         ;;
       0) return ;;
@@ -1688,6 +1959,137 @@ update_menu() {
   pausa
 }
 
+
+# ---------- AJUSTES (Soporte / IA / Descargas) ----------
+ajustes_menu() {
+  ensure_config
+  while true; do
+    clear
+    echo -e "${CYAN}${BOLD}⚙️ Ajustes${NC}"
+    echo "[1] 📞 Soporte (WhatsApp / Telegram / Link)"
+    echo "[2] 🧠 IA Gemini (API Key)"
+    echo "[3] 🌐 Descargas (APK URL / HTTP Custom)"
+    echo "[0] Volver"
+    echo
+    read -rp "Opción: " o
+    case "$o" in
+      1) ajustar_soporte ;;
+      2) ajustar_gemini ;;
+      3) ajustar_descargas ;;
+      0) return ;;
+      *) echo -e "${RED}❌ Opción inválida${NC}"; sleep 1 ;;
+    esac
+  done
+}
+
+ajustar_soporte() {
+  ensure_config
+  local sup wa tg tut
+  sup="$(get_json '.links.support // ""')"
+  wa="$(get_json '.links.support_whatsapp // ""')"
+  tg="$(get_json '.links.telegram // ""')"
+  tut="$(get_json '.links.tutorial // ""')"
+
+  clear
+  echo -e "${CYAN}${BOLD}📞 Configurar soporte y links${NC}"
+  echo "----------------------------------------"
+  echo "• Soporte (link):        ${sup}"
+  echo "• WhatsApp (wa.me):      ${wa}"
+  echo "• Telegram (t.me/alias): ${tg}"
+  echo "• Tutorial:              ${tut}"
+  echo
+  read -rp "Nuevo link soporte (enter=mantener): " nsup
+  read -rp "Nuevo link WhatsApp wa.me (enter=mantener): " nwa
+  read -rp "Nuevo alias/link Telegram (enter=mantener): " ntg
+  read -rp "Nuevo link tutorial (enter=mantener): " ntut
+
+  [[ -z "$nsup" ]] && nsup="$sup"
+  [[ -z "$nwa" ]] && nwa="$wa"
+  [[ -z "$ntg" ]] && ntg="$tg"
+  [[ -z "$ntut" ]] && ntut="$tut"
+
+  set_json ".links.support = \"$nsup\" | .links.support_whatsapp = \"$nwa\" | .links.telegram = \"$ntg\" | .links.tutorial = \"$ntut\""
+  echo -e "${GREEN}✅ Guardado.${NC}"
+  echo -e "${YELLOW}Tip: reiniciá el bot (PM2) para aplicar al instante si no actualiza solo.${NC}"
+  pausa
+}
+
+ajustar_gemini() {
+  ensure_config
+  local en key
+  en="$(get_json '.gemini.enabled // false')"
+  key="$(get_json '.gemini.api_key // ""')"
+
+  clear
+  echo -e "${CYAN}${BOLD}🧠 IA Gemini${NC}"
+  echo "----------------------------------------"
+  echo "Estado: $en"
+  if [[ -n "$key" && "$key" != "null" ]]; then
+    echo "Key: ${key:0:8}********"
+  else
+    echo "Key: (vacía)"
+  fi
+  echo
+  read -rp "¿Habilitar IA? (s/N): " yn
+  if [[ "$yn" == "s" || "$yn" == "S" ]]; then
+    set_json ".gemini.enabled = true"
+  elif [[ "$yn" == "n" || "$yn" == "N" || -z "$yn" ]]; then
+    # no cambia
+    :
+  fi
+
+  read -rp "Pegar API Key (enter=mantener): " nk
+  [[ -n "$nk" ]] && set_json ".gemini.api_key = \"$nk\""
+
+  echo -e "${GREEN}✅ Configurado.${NC}"
+  echo -e "${YELLOW}Recomendado: reiniciar bot para aplicar (PM2 -> restart).${NC}"
+  pausa
+}
+
+ajustar_descargas() {
+  ensure_config
+  local apkurl curl cmsg
+  apkurl="$(get_json '.downloads.apk_url // ""')"
+  curl="$(get_json '.downloads.custom_url // ""')"
+  cmsg="$(get_json '.downloads.custom_message // ""')"
+
+  clear
+  echo -e "${CYAN}${BOLD}🌐 Descargas (cliente)${NC}"
+  echo "----------------------------------------"
+  echo "APK URL (si no se envía archivo):"
+  echo "  $apkurl"
+  echo
+  echo "HTTP Custom URL:"
+  echo "  $curl"
+  echo
+  echo "Mensaje HTTP Custom (usa {URL} como placeholder):"
+  echo "  $(echo "$cmsg" | head -n 3)"
+  echo
+  read -rp "Nuevo APK URL (enter=mantener): " napk
+  read -rp "Nuevo HTTP Custom URL (enter=mantener): " ncurl
+  echo
+  echo "Editar mensaje HTTP Custom ahora? (s/N)"
+  read -rp "> " edit
+  if [[ "$edit" == "s" || "$edit" == "S" ]]; then
+    echo "Pegá el mensaje completo. Terminá con una línea que diga: EOF"
+    tmp="$(mktemp)"
+    while IFS= read -r line; do
+      [[ "$line" == "EOF" ]] && break
+      echo "$line" >> "$tmp"
+    done
+    newmsg="$(cat "$tmp")"
+    rm -f "$tmp"
+    [[ -n "$newmsg" ]] && cmsg="$newmsg"
+  fi
+
+  [[ -z "$napk" ]] && napk="$apkurl"
+  [[ -z "$ncurl" ]] && ncurl="$curl"
+
+  set_json ".downloads.apk_url = \"$napk\" | .downloads.custom_url = \"$ncurl\" | .downloads.custom_message = \"$cmsg\""
+  echo -e "${GREEN}✅ Guardado.${NC}"
+  pausa
+}
+
 main_menu() {
   require_root
   ensure_dirs
@@ -1708,6 +2110,7 @@ main_menu() {
     echo "[9] 📊 Estadísticas / Ventas / Ganancias"
     echo "[10] 🔁 Migrar usuario -> Token"
     echo "[11] 🔄 Update (npm install + restart)"
+    echo "[12] ⚙️ Ajustes (Soporte / IA / Descargas)"
     echo "[0] 🚪 Salir"
     echo
     read -rp "Opción: " opt
@@ -1723,6 +2126,7 @@ main_menu() {
       9) stats_menu ;;
       10) migrar_usuario_a_token ;;
       11) update_menu ;;
+      12) ajustes_menu ;;
       0) exit 0 ;;
       *) echo -e "${RED}❌ Opción inválida${NC}"; sleep 1 ;;
     esac
@@ -1742,4 +2146,3 @@ echo -e "${GREEN}${BOLD}✅ Instalación EMBED completada.${NC}"
 echo -e "${CYAN}👉 Panel: ${BOLD}sshbot${NC}"
 echo -e "${CYAN}👉 QR: en panel opción [2] (borra sesión + fuerza QR nuevo)${NC}"
 echo
-
