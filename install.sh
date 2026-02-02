@@ -57,6 +57,11 @@ echo -e "${GREEN}✅ IP detectada: ${CYAN}${SERVER_IP}${NC}\n"
 echo -e "${YELLOW}⚠️  ESTE INSTALADOR INSTALA:${NC}"
 echo -e "   ✅ 🤖 Bot WhatsApp + panel admin PRO"
 echo -e "   ✅ 💳 MercadoPago integrado (token editable desde panel)"
+echo -e "      ↳ QR de pago + link + referencia (external_reference)"
+echo -e "      ↳ Verificación automática cada 2 min + auto-entrega al aprobar"
+echo -e "   ✅ 🏦 Transferencia bancaria: Alias/CBU/Titular editables desde panel"
+echo -e "      ↳ El cliente envía comprobante + REF + link al WhatsApp del admin"
+echo -e "      ↳ Pendientes en panel + confirmación manual + auto-entrega (15 min)"
 echo -e "   ✅ 💲 Precios editables 7/15/30 desde panel"
 echo -e "   ✅ 🧩 Selector de app en compra: APK / HC(HWID) / Token-Only"
 echo -e "   ✅ 🆔 HWID: user+pass = HWID + envío de <HWID>.hc"
@@ -90,9 +95,6 @@ apt-get install -y -qq \
 
 # Extras (no romper si no existen en el repo)
 apt-get install -y -qq qrencode chafa >/dev/null 2>&1 || true
-if apt-cache show viu >/dev/null 2>&1; then
-  apt-get install -y -qq viu >/dev/null 2>&1 || true
-fi
 
 systemctl enable atd >/dev/null 2>&1 || true
 systemctl start atd >/dev/null 2>&1 || true
@@ -126,6 +128,14 @@ if [[ ! -s "$CONFIG_FILE" ]]; then
   "admins": [],
   "prices": { "test_hours": 2, "plan_7": 500, "plan_15": 800, "plan_30": 1200, "currency": "ARS" },
   "mercadopago": { "access_token": "", "enabled": false },
+"transfer": {
+  "enabled": true,
+  "alias": "",
+  "cbu": "",
+  "titular": "",
+  "admin_whatsapp": ""
+},
+
   "gemini": { "enabled": false, "api_key": "" },
   "links": {
     "tutorial": "https://youtube.com",
@@ -178,6 +188,15 @@ CREATE TABLE IF NOT EXISTS payments (
  status TEXT DEFAULT 'pending',
  plan TEXT,
  app_type TEXT,
+ method TEXT DEFAULT 'mp',
+ receipt_path TEXT,
+ receipt_mime TEXT,
+ reminded INTEGER DEFAULT 0,
+ payment_url TEXT,
+ qr_path TEXT,
+ mp_payment_id TEXT,
+ mp_status_detail TEXT,
+ delivered INTEGER DEFAULT 0,
  created_at TEXT DEFAULT CURRENT_TIMESTAMP,
  approved_at TEXT
 );
@@ -185,7 +204,6 @@ SQL
 
 echo -e "${CYAN}${BOLD}🤖 Instalando bot.js (embebido)...${NC}"
 cat > "$BOT_HOME/bot.js" <<'BOTJS'
-#!/usr/bin/env node
 /**
  * SSH BOT ELNENE PRO – bot.js (embedded)
  * Version: 8.8.27
@@ -291,6 +309,41 @@ function downloadsCfg() {
   };
 }
 
+
+function transferCfg() {
+  return {
+    enabled: !!cfg("transfer.enabled", true),
+    alias: cfg("transfer.alias", ""),
+    cbu: cfg("transfer.cbu", ""),
+    titular: cfg("transfer.titular", ""),
+    admin_whatsapp: String(cfg("transfer.admin_whatsapp", "") || cfg("links.support_whatsapp", "") || "").replace(/\D/g, ""),
+  };
+}
+
+function paymentMethodMenuText() {
+  return `💳 *Método de pago*\n\n1) MercadoPago (tarjeta / saldo)\n2) Transferencia\n\n(Respondé: 1/2)`;
+}
+
+function transferInstructionsText(ref) {
+  const t = transferCfg();
+  const lines = [];
+  lines.push("🏦 *Transferencia bancaria*");
+  if (t.titular) lines.push(`👤 Titular: *${t.titular}*`);
+  if (t.alias) lines.push(`🔤 Alias: *${t.alias}*`);
+  if (t.cbu) lines.push(`🏛️ CBU: *${t.cbu}*`);
+  lines.push("");
+  lines.push("📎 *Luego enviá el comprobante acá mismo* (foto o PDF).");
+  lines.push("⏳ Se procesa en menos de *15 minutos* (a confirmar por el admin).");
+  lines.push("");
+  const admin = t.admin_whatsapp;
+  if (admin) {
+    const msg = encodeURIComponent(`CONFIRMAR PAGO ${ref}`);
+    lines.push("⚡ Para avisar al admin rápidamente:");
+    lines.push(`👉 https://wa.me/${admin}?text=${msg}`);
+    lines.push(`(o copiá y pegá: CONFIRMAR PAGO ${ref})`);
+  }
+  return lines.join("\n");
+}
 function geminiCfg() {
   return {
     enabled: !!cfg("gemini.enabled", false),
@@ -401,6 +454,23 @@ function log(msg) {
   console.log(line);
   try { fs.appendFileSync(path.join(INSTALL_DIR, "logs", "bot.log"), line + "\n"); } catch {}
 }
+
+function chatIdFromPhone(phone) {
+  const p = String(phone || "").trim();
+  if (!p) return "";
+  return p.includes("@") ? p : `${p}@c.us`;
+}
+
+async function safeSend(client, phone, text, opts = {}) {
+  try {
+    const to = chatIdFromPhone(phone);
+    if (!to) return;
+    await client.sendMessage(to, text, Object.assign({ sendSeen: false }, opts));
+  } catch (e) {
+    log(`sendMessage error: ${e && e.message ? e.message : e}`);
+  }
+}
+
 
 function ensureDb() {
   fs.mkdirSync(path.dirname(DB_FILE), { recursive: true });
@@ -569,56 +639,303 @@ async function createToken(phone, plan, daysOrNull) {
   return { token, expires_at: exp };
 }
 
-async function mpCreatePreference({ phone, plan, appType }) {
-  const amount = planPrice(plan);
-  if (!MP_ENABLED) throw new Error("MercadoPago no está configurado.");
+async function ensurePaymentsColumns() {
+  try {
+    const cols = await dbAll("PRAGMA table_info(payments)");
+    const names = new Set((cols || []).map(c => c.name));
+    const alters = [];
+    if (!names.has("payment_url")) alters.push("ALTER TABLE payments ADD COLUMN payment_url TEXT");
+    if (!names.has("qr_path")) alters.push("ALTER TABLE payments ADD COLUMN qr_path TEXT");
+    if (!names.has("mp_payment_id")) alters.push("ALTER TABLE payments ADD COLUMN mp_payment_id TEXT");
+    if (!names.has("mp_status_detail")) alters.push("ALTER TABLE payments ADD COLUMN mp_status_detail TEXT");
+    if (!names.has("delivered")) alters.push("ALTER TABLE payments ADD COLUMN delivered INTEGER DEFAULT 0");
+    if (!names.has("method")) alters.push("ALTER TABLE payments ADD COLUMN method TEXT DEFAULT 'mp'");
+    if (!names.has("receipt_path")) alters.push("ALTER TABLE payments ADD COLUMN receipt_path TEXT");
+    if (!names.has("receipt_mime")) alters.push("ALTER TABLE payments ADD COLUMN receipt_mime TEXT");
+    if (!names.has("reminded")) alters.push("ALTER TABLE payments ADD COLUMN reminded INTEGER DEFAULT 0");
+    for (const sql of alters) {
+      try { await dbRun(sql, []); } catch {}
+    }
+  } catch {}
+}
 
-  const external_reference = `SSH-${phone}-${Date.now()}-${randStr(4)}`;
+function mpHeaders() {
+  return { Authorization: `Bearer ${MP_TOKEN}`, "Content-Type": "application/json" };
+}
 
-  // Create preference via API (simpler & avoids SDK incompatibilities)
+function mpPrefBody({ external_reference, plan, appType }) {
+  // ISO-8601 expirations (24h window)
+  const from = new Date();
+  const to = new Date(from.getTime() + 24 * 60 * 60 * 1000);
+
   const body = {
     items: [
       {
         title: `${BOT_NAME} – ${planLabel(plan)} – ${appLabel(appType)}`,
         quantity: 1,
         currency_id: CURRENCY,
-        unit_price: Number(amount || 0)
+        unit_price: Number(planPrice(plan) || 0)
       }
     ],
     external_reference,
     expires: true,
-    // expiration_date_from / to can be added if needed
+    expiration_date_from: from.toISOString(),
+    expiration_date_to: to.toISOString(),
   };
+
+  // Optional: notification_url (webhook) if admin set it in config
+  const notif = cfg("mercadopago.notification_url", "");
+  if (notif) body.notification_url = String(notif);
+
+  // Optional: back_urls for better UX in MP app
+  const wa = phoneToWa(cfg("links.support_whatsapp", "")) || "";
+  const backBase = cfg("mercadopago.back_urls_base", "");
+  if (backBase) {
+    body.back_urls = {
+      success: `${backBase}?status=success&ref=${encodeURIComponent(external_reference)}`,
+      failure: `${backBase}?status=failure&ref=${encodeURIComponent(external_reference)}`,
+      pending: `${backBase}?status=pending&ref=${encodeURIComponent(external_reference)}`
+    };
+    body.auto_return = "approved";
+  } else if (wa) {
+    // fallback to wa.me if admin configured WhatsApp
+    body.back_urls = {
+      success: `https://wa.me/${wa}?text=Pago%20exitoso%20(ref%20${encodeURIComponent(external_reference)})`,
+      failure: `https://wa.me/${wa}?text=Pago%20fallido%20(ref%20${encodeURIComponent(external_reference)})`,
+      pending: `https://wa.me/${wa}?text=Pago%20pendiente%20(ref%20${encodeURIComponent(external_reference)})`
+    };
+    body.auto_return = "approved";
+  }
+
+  return body;
+}
+
+async function mpCreatePreference({ phone, plan, appType }) {
+  const amount = planPrice(plan);
+  if (!MP_ENABLED) throw new Error("MercadoPago no está configurado.");
+  if (!amount || Number(amount) <= 0) throw new Error("No hay precio configurado para ese plan.");
+
+  await ensurePaymentsColumns();
+
+  const external_reference = `SSH-${phone}-${Date.now()}-${randStr(4)}`;
+
+  // Create preference via API (stable & simple)
+  const body = mpPrefBody({ external_reference, plan, appType });
 
   const resp = await axios.post(
     "https://api.mercadopago.com/checkout/preferences",
     body,
-    { headers: { Authorization: `Bearer ${MP_TOKEN}` }, timeout: 15000 }
+    { headers: mpHeaders(), timeout: 20000 }
   );
 
-  const pref = resp.data;
+  const pref = resp.data || {};
+  const init_point = pref.init_point || pref.sandbox_init_point || "";
+  const prefId = pref.id || "";
+
+  // QR file (payment QR)
+  let qrPath = "";
+  try {
+    const qrDir = path.join(INSTALL_DIR, "qr_codes");
+    fs.mkdirSync(qrDir, { recursive: true });
+    qrPath = path.join(qrDir, `${external_reference}.png`);
+    if (init_point) {
+      await qrcode.toFile(qrPath, init_point, { width: 500, margin: 1, errorCorrectionLevel: "M" });
+    }
+  } catch { qrPath = ""; }
+
+  // Persist
   await dbRun(
-    "INSERT OR IGNORE INTO payments(phone, external_reference, preference_id, amount, currency, status, plan, app_type) VALUES(?,?,?,?,?, 'pending', ?, ?)",
-    [phone, external_reference, pref.id, amount, CURRENCY, plan, appType]
+    "INSERT OR IGNORE INTO payments(phone, external_reference, preference_id, amount, currency, status, plan, app_type, payment_url, qr_path, delivered) VALUES(?,?,?,?,?, 'pending', ?, ?, ?, ?, 0)",
+    [phone, external_reference, prefId, amount, CURRENCY, String(plan), String(appType), init_point, qrPath]
   );
 
-  return { init_point: pref.init_point, preference_id: pref.id, external_reference };
+  return { init_point, preference_id: prefId, external_reference, qr_path: qrPath };
 }
 
 async function mpCheckApproved(external_reference) {
   if (!MP_ENABLED) return { approved: false, reason: "MP no configurado" };
 
-  // Search payments by external_reference
-  const url = `https://api.mercadopago.com/v1/payments/search?external_reference=${encodeURIComponent(external_reference)}`;
-  const resp = await axios.get(url, { headers: { Authorization: `Bearer ${MP_TOKEN}` }, timeout: 15000 });
-  const results = resp.data && resp.data.results ? resp.data.results : [];
-  // Pick latest
-  results.sort((a,b) => (b.date_created || "").localeCompare(a.date_created || ""));
-  const pay = results[0];
-  if (!pay) return { approved: false, reason: "Sin pagos encontrados aún" };
-  if (pay.status === "approved") return { approved: true, payment: pay };
-  return { approved: false, reason: `Estado: ${pay.status}` };
+  try {
+    // Search payments by external_reference
+    const url = `https://api.mercadopago.com/v1/payments/search?external_reference=${encodeURIComponent(external_reference)}`;
+    const resp = await axios.get(url, { headers: mpHeaders(), timeout: 20000 });
+    const results = (resp.data && resp.data.results) ? resp.data.results : [];
+
+    // Pick latest
+    results.sort((a, b) => (b.date_created || "").localeCompare(a.date_created || ""));
+    const pay = results[0];
+    if (!pay) return { approved: false, reason: "Sin pagos encontrados aún" };
+
+    if (pay.status === "approved") return { approved: true, payment: pay };
+    if (pay.status === "rejected") return { approved: false, reason: `Rechazado (${pay.status_detail || "sin detalle"})`, payment: pay };
+    if (pay.status === "cancelled") return { approved: false, reason: "Cancelado", payment: pay };
+    return { approved: false, reason: `Estado: ${pay.status}${pay.status_detail ? " (" + pay.status_detail + ")" : ""}`, payment: pay };
+  } catch (e) {
+    return { approved: false, reason: `Error consultando MP: ${e && e.message ? e.message : "desconocido"}` };
+  }
 }
+
+async function mpProcessPendingPayments(client) {
+  if (!MP_ENABLED) return;
+  await ensurePaymentsColumns();
+
+  const rows = await dbAll(
+    "SELECT phone, external_reference, plan, app_type, amount, currency, payment_url, qr_path FROM payments WHERE status='pending' AND (method IS NULL OR method='mp') AND (delivered IS NULL OR delivered=0) AND created_at >= datetime('now','-48 hours') ORDER BY id ASC",
+    []
+  );
+
+  if (!rows || !rows.length) return;
+
+  for (const p of rows) {
+    try {
+      const chk = await mpCheckApproved(p.external_reference);
+      if (!chk.approved) continue;
+
+      const pay = chk.payment || {};
+      await dbRun(
+        "UPDATE payments SET status='approved', approved_at=?, mp_payment_id=?, mp_status_detail=? WHERE external_reference=?",
+        [nowIso(), String(pay.id || ""), String(pay.status_detail || ""), p.external_reference]
+      );
+
+      const appType = p.app_type || "apk";
+      const plan = p.plan || "7";
+
+      if (appType === "token") {
+        const days = plan === "7" ? 7 : plan === "15" ? 15 : plan === "30" ? 30 : 1;
+        const t = await createToken(p.phone, plan, days);
+        await safeSend(client, p.phone,
+          `🎉 *PAGO CONFIRMADO*\n\n🔑 *Token*: ${t.token}\n📅 Expira: ${t.expires_at || "∞"}\n\n📌 Escribí *menu* para ver opciones.`
+        );
+      } else {
+        const u = await createDbUser(p.phone, plan, appType);
+        let extra = "";
+        if (appType === "apk") {
+          const d = downloadsCfg();
+          if (d.apk_url) extra = `\n\n📲 Descarga APK:\n${d.apk_url}`;
+          else extra = "\n\n📲 Escribí *5* para descargar la app.";
+        } else if (appType === "hc") {
+          extra = "\n\n🆔 Enviá tu *HWID* para activar.\n" + customDownloadText();
+        }
+        await safeSend(client, p.phone,
+          `🎉 *PAGO CONFIRMADO*\n\n👤 Usuario: *${u.username}*\n🔐 Pass: *${u.password}*\n📅 Expira: *${u.expires_at || "∞"}*${extra}`
+        );
+      }
+
+      await dbRun("UPDATE payments SET delivered=1 WHERE external_reference=?", [p.external_reference]);
+    } catch (e) {
+      log(`MP process error: ${e && e.message ? e.message : e}`);
+    }
+  }
+}
+
+async function transferProcessApprovedPayments(client) {
+  await ensurePaymentsColumns();
+  const rows = await dbAll(
+    "SELECT phone, external_reference, plan, app_type, amount, currency, receipt_path, receipt_mime FROM payments WHERE method='transfer' AND status='approved' AND (delivered IS NULL OR delivered=0) AND created_at >= datetime('now','-14 days') ORDER BY id ASC",
+    []
+  );
+  if (!rows || !rows.length) return;
+
+  for (const p of rows) {
+    try {
+      const appType = p.app_type || "apk";
+      const plan = p.plan || "7";
+      if (appType === "token") {
+        const days = plan === "7" ? 7 : plan === "15" ? 15 : plan === "30" ? 30 : 1;
+        const t = await createToken(p.phone, plan, days);
+        await safeSend(client, p.phone,
+          `🎉 *PAGO CONFIRMADO (Transferencia)*\n\n🔑 *Token*: ${t.token}\n📅 Expira: ${t.expires_at || "∞"}\n\n📌 Escribí *menu* para ver opciones.`
+        );
+      } else {
+        const u = await createDbUser(p.phone, plan, appType);
+        let extra = "";
+        if (appType === "apk") {
+          const d = downloadsCfg();
+          if (d.apk_url) extra = `\n\n📲 Descarga APK:\n${d.apk_url}`;
+          else extra = "\n\n📲 Escribí *5* para descargar la app.";
+        } else if (appType === "hc") {
+          extra = "\n\n🆔 Enviá tu *HWID* para activar.\n" + customDownloadText();
+        }
+        await safeSend(client, p.phone,
+          `🎉 *PAGO CONFIRMADO (Transferencia)*\n\n👤 Usuario: *${u.username}*\n🔐 Pass: *${u.password}*\n📅 Expira: *${u.expires_at || "∞"}*${extra}`
+        );
+      }
+      await dbRun("UPDATE payments SET delivered=1 WHERE external_reference=?", [p.external_reference]);
+    } catch (e) {
+      log(`Transfer deliver error: ${e && e.message ? e.message : e}`);
+    }
+  }
+}
+
+async function transferSendReminders(client) {
+  await ensurePaymentsColumns();
+  const rows = await dbAll(
+    "SELECT phone, external_reference, plan, app_type, amount, currency, created_at FROM payments WHERE method='transfer' AND status='pending_admin' AND (reminded IS NULL OR reminded=0) AND created_at <= datetime('now','-15 minutes') ORDER BY id ASC",
+    []
+  );
+  if (!rows || !rows.length) return;
+
+  for (const p of rows) {
+    try {
+      await safeSend(client, p.phone,
+        `⏳ *Pago en revisión*\n\nRef: *${p.external_reference}*\nEstamos esperando la confirmación del admin.\nSi ya enviaste el comprobante, por favor aguardá unos minutos más.`
+      );
+      // ping admin(s)
+      const admin = transferCfg().admin_whatsapp;
+      if (admin) {
+        await safeSend(client, `${admin}@c.us`,
+          `🏦 Pago por transferencia pendiente >15min\nRef: ${p.external_reference}\nTel: ${String(p.phone).split("@")[0]}\nPlan: ${planLabel(p.plan)} | App: ${appLabel(p.app_type)} | $${p.amount} ${p.currency}`
+        );
+      } else if (ADMIN_NUMBERS.length) {
+        await safeSend(client, `${ADMIN_NUMBERS[0]}@c.us`,
+          `🏦 Pago por transferencia pendiente >15min\nRef: ${p.external_reference}\nTel: ${String(p.phone).split("@")[0]}\nPlan: ${planLabel(p.plan)} | App: ${appLabel(p.app_type)} | $${p.amount} ${p.currency}`
+        );
+      }
+      await dbRun("UPDATE payments SET reminded=1 WHERE external_reference=?", [p.external_reference]);
+    } catch {}
+  }
+}
+
+function makeTransferRef(phone) {
+  const p = String(phone || "").replace(/\D/g, "");
+  const last = p.slice(-4) || "0000";
+  return `TR-${Date.now()}-${last}`;
+}
+
+async function saveReceiptFromMsg(msg, ref) {
+  try {
+    if (!msg.hasMedia) return { path: "", mime: "" };
+    const media = await msg.downloadMedia();
+    if (!media || !media.data) return { path: "", mime: media ? (media.mimetype || "") : "" };
+
+    const dir = path.join(INSTALL_DIR, "receipts");
+    try { fs.mkdirSync(dir, { recursive: true }); } catch {}
+    const mime = media.mimetype || "";
+    const ext =
+      mime.includes("png") ? "png" :
+      mime.includes("pdf") ? "pdf" :
+      mime.includes("jpeg") || mime.includes("jpg") ? "jpg" :
+      "bin";
+    const outPath = path.join(dir, `${ref}.${ext}`);
+    fs.writeFileSync(outPath, Buffer.from(media.data, "base64"));
+    return { path: outPath, mime };
+  } catch (e) {
+    return { path: "", mime: "" };
+  }
+}
+
+async function createTransferPayment({ phone, plan, appType, receiptPath, receiptMime, amount }) {
+  await ensurePaymentsColumns();
+  const ref = makeTransferRef(phone);
+  const cur = CURRENCY;
+  await dbRun(
+    "INSERT INTO payments (phone, external_reference, amount, currency, status, plan, app_type, method, receipt_path, receipt_mime, created_at, delivered, reminded) VALUES (?,?,?,?,?,?,?,?,?,?,datetime('now'),0,0)",
+    [phone, ref, amount, cur, "pending_admin", plan, appType, "transfer", receiptPath || "", receiptMime || ""]
+  );
+  return ref;
+}
+
+
 
 const sessions = new Map(); // phone -> session state
 
@@ -840,14 +1157,26 @@ async function handleMessage(client, msg) {
   if (lower.startsWith("verificar")) {
     const ref = text.split(/\s+/)[1];
     if (!ref) return client.sendMessage(msg.from, "Usá: verificar <REF>");
-    const row = await dbGet("SELECT status, plan, app_type, phone FROM payments WHERE external_reference=?", [ref]);
+    const row = await dbGet("SELECT status, plan, app_type, phone, method, delivered FROM payments WHERE external_reference=?", [ref]);
     if (!row) return client.sendMessage(msg.from, "No encuentro esa referencia.");
+if (row.method === "transfer") {
+  if (row.status === "approved") {
+    return client.sendMessage(msg.from, "✅ Transferencia confirmada. Si todavía no recibiste el acceso, esperá 1-2 minutos o avisá al admin.");
+  }
+  if (row.status === "pending_admin") {
+    return client.sendMessage(msg.from, "⏳ Transferencia en revisión por el admin. Se procesa en ~15 min.");
+  }
+  return client.sendMessage(msg.from, `ℹ️ Estado actual: ${String(row.status || "").toUpperCase()}`);
+}
+
     if (row.status === "approved") return client.sendMessage(msg.from, "✅ Ya estaba aprobado. Si no recibiste acceso, avisá al admin.");
 
     const chk = await mpCheckApproved(ref);
     if (!chk.approved) return client.sendMessage(msg.from, `⏳ Aún no aprobado. ${chk.reason}`);
 
-    await dbRun("UPDATE payments SET status='approved', approved_at=? WHERE external_reference=?", [nowIso(), ref]);
+    await ensurePaymentsColumns();
+    const pay = chk.payment || {};
+    await dbRun("UPDATE payments SET status='approved', approved_at=?, mp_payment_id=?, mp_status_detail=?, delivered=1 WHERE external_reference=?", [nowIso(), String(pay.id || ""), String(pay.status_detail || ""), ref]);
 
     const appType = row.app_type || "apk";
     const plan = row.plan || "7";
@@ -946,20 +1275,108 @@ async function handleMessage(client, msg) {
       }
     }
 
-    // Paid plans:
-    if (!MP_ENABLED) {
-      resetSession(phone);
-      return client.sendMessage(msg.from,
-        `⚠️ MercadoPago no está configurado.\nContactá al admin para habilitar pagos.\n\n${pricesText()}`
-      );
-    }
+// Paid plans: elegir método de pago
+s.step = "choose_payment_method";
+const hint = MP_ENABLED ? "" : "\n\n⚠️ MercadoPago no está configurado en el servidor, usá *2) Transferencia*.";
+return client.sendMessage(msg.from, paymentMethodMenuText() + hint, { sendSeen: false });
 
-    const pref = await mpCreatePreference({ phone, plan: s.plan, appType: app });
+  }
+// Step: payment method
+if (s.step === "choose_payment_method") {
+  const ans = lower;
+  if (ans === "1" || ans === "mp" || ans === "mercadopago") {
+    if (!MP_ENABLED) {
+      return client.sendMessage(msg.from, "⚠️ MercadoPago no está configurado. Elegí *2) Transferencia*.", { sendSeen: false });
+    }
+    // crear preferencia MP
+    const pref = await mpCreatePreference({ phone, plan: s.plan, appType: s.app });
     resetSession(phone);
-    return client.sendMessage(msg.from,
-      `🧾 *Orden creada*\n• Plan: ${planLabel(s.plan)}\n• Tipo: ${appLabel(app)}\n• Total: $${planPrice(s.plan)} ${CURRENCY}\n\n✅ Pagá aquí:\n${pref.init_point}\n\n🔎 Luego enviá:\n*verificar ${pref.external_reference}*`
+
+    const payText =
+      `✅ *Compra iniciada*\n\nPlan: *${planLabel(s.plan)}*\nTipo: *${appLabel(s.app)}*\nTotal: $${planPrice(s.plan)} ${CURRENCY}` +
+      `\n\n✅ Pagá aquí:\n${pref.init_point}` +
+      `\n\n🔄 Verificación automática cada 2 minutos.\nTambién podés escribir:\n*verificar ${pref.external_reference}*`;
+
+    await client.sendMessage(msg.from, payText, { sendSeen: false });
+
+    // Enviar QR de pago
+    try {
+      if (pref.qr_path && fs.existsSync(pref.qr_path)) {
+        const media = MessageMedia.fromFilePath(pref.qr_path);
+        await client.sendMessage(msg.from, media, { caption: "📱 QR MercadoPago", sendSeen: false });
+      }
+    } catch {}
+    return;
+  }
+
+  if (ans === "2" || ans === "transfer" || ans === "transferencia") {
+    // Transferencia: pedir comprobante
+    s.step = "await_transfer_receipt";
+    const refPreview = makeTransferRef(phone);
+    // mostramos un ref preliminar para el link (se confirmará al guardar)
+    return client.sendMessage(msg.from, transferInstructionsText(refPreview), { sendSeen: false });
+  }
+
+  return client.sendMessage(msg.from, "Elegí: 1) MercadoPago  2) Transferencia", { sendSeen: false });
+}
+
+// Step: wait receipt for transfer
+if (s.step === "await_transfer_receipt") {
+  if (lower === "cancelar" || lower === "menu") {
+    resetSession(phone);
+    return client.sendMessage(msg.from, "✅ Operación cancelada. Escribí *menu* para ver opciones.", { sendSeen: false });
+  }
+
+  if (!msg.hasMedia) {
+    return client.sendMessage(msg.from, "📎 Enviá el *comprobante* (foto o PDF).\n\nO escribí *cancelar* para salir.", { sendSeen: false });
+  }
+
+  const ref = makeTransferRef(phone);
+  const receipt = await saveReceiptFromMsg(msg, ref);
+  const refSaved = await createTransferPayment({
+    phone,
+    plan: s.plan,
+    appType: s.app,
+    receiptPath: receipt.path,
+    receiptMime: receipt.mime,
+    amount: planPrice(s.plan),
+  });
+
+  // avisar usuario
+  await client.sendMessage(
+    msg.from,
+    `✅ Comprobante recibido.\n\nRef: *${refSaved}*\n⏳ Tu pago se procesará en menos de *15 minutos* (confirmación del admin).`,
+    { sendSeen: false }
+  );
+
+  const t = transferCfg();
+  if (t.admin_whatsapp) {
+    const msgTxt = encodeURIComponent(`CONFIRMAR PAGO ${refSaved}`);
+    await client.sendMessage(
+      msg.from,
+      `⚡ Para avisar al admin rápido:\n👉 https://wa.me/${t.admin_whatsapp}?text=${msgTxt}`,
+      { sendSeen: false }
     );
   }
+
+  // notificar admin
+  try {
+    const adminChat = (t.admin_whatsapp ? `${t.admin_whatsapp}@c.us` : (ADMIN_NUMBERS[0] ? `${ADMIN_NUMBERS[0]}@c.us` : ""));
+    if (adminChat) {
+      await safeSend(client, adminChat,
+        `🏦 *Nuevo pago por transferencia*\nRef: *${refSaved}*\nTel: ${String(phone).split("@")[0]}\nPlan: ${planLabel(s.plan)} | App: ${appLabel(s.app)}\nMonto: $${planPrice(s.plan)} ${CURRENCY}\n\nConfirmar desde panel: sshbot → Transferencias`
+      );
+      if (receipt.path && fs.existsSync(receipt.path)) {
+        const media = MessageMedia.fromFilePath(receipt.path);
+        await safeSend(client, adminChat, media, { caption: `Comprobante ${refSaved}` });
+      }
+    }
+  } catch {}
+
+  resetSession(phone);
+  return;
+}
+
 
   // Default response minimal
   if (lower === "hola" || lower === "buenas" || lower === "buenos dias" || lower === "buenas tardes" || lower === "buenas noches") {
@@ -1007,9 +1424,20 @@ function main() {
     log("✅ WhatsApp listo.");
     try { fs.unlinkSync(QR_TXT); } catch {}
     try { fs.unlinkSync(QR_PNG); } catch {}
+
+    // Auto-verificación MercadoPago (cada 2 min) – mantiene el comando "verificar <REF>"
+    if (MP_ENABLED) {
+      log("💳 MercadoPago: verificación automática cada 2 minutos.");
+      setTimeout(() => { mpProcessPendingPayments(client).catch(()=>{}); }, 8000);
+      setInterval(() => { mpProcessPendingPayments(client).catch(()=>{}); }, 120000);
+// Transferencias: entregar pagos confirmados por admin + recordatorios
+setTimeout(() => { transferProcessApprovedPayments(client).catch(()=>{}); }, 12000);
+setInterval(() => { transferProcessApprovedPayments(client).catch(()=>{}); }, 60000);
+setInterval(() => { transferSendReminders(client).catch(()=>{}); }, 60000);
+    }
   });
 
-  client.on("authenticated", () => log("🔐 Autenticado."));
+client.on("authenticated", () => log("🔐 Autenticado."));
   client.on("auth_failure", (msg) => log(`❌ Auth failure: ${msg}`));
   client.on("disconnected", (reason) => log(`⚠️ Desconectado: ${reason}`));
 
@@ -1060,6 +1488,7 @@ process.on("SIGTERM", () => { try { db.close(); } catch {} process.exit(0); });
 
 main();
 BOTJS
+
 chmod +x "$BOT_HOME/bot.js" >/dev/null 2>&1 || true
 
 echo -e "${CYAN}${BOLD}📦 Instalando dependencias Node...${NC}"
@@ -1116,6 +1545,7 @@ PANEL_PATH="/usr/local/bin/ssh-bot-panel.sh"
 mkdir -p /usr/local/bin
 
 cat > "$PANEL_PATH" <<'PANELEOF'
+
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -1239,7 +1669,18 @@ ensure_config() {
   "bot": { "name": "SSH BOT ELNENE PRO", "version": "8.8.27" },
   "admins": [],
   "prices": { "test_hours": 2, "plan_7": 500, "plan_15": 800, "plan_30": 1200, "currency": "ARS" },
-  "mercadopago": { "access_token": "", "enabled": false },
+  "mercadopago": {
+      "access_token": "",
+      "enabled": false
+    },
+    "transfer": {
+      "enabled": true,
+      "alias": "",
+      "cbu": "",
+      "titular": "",
+      "admin_whatsapp": ""
+    },
+    "gemini": { "access_token": "", "enabled": false },
   "gemini": { "enabled": false, "api_key": "" },
   "links": {
     "tutorial": "https://youtube.com",
@@ -1299,6 +1740,14 @@ ensure_db() {
       created_at TEXT DEFAULT CURRENT_TIMESTAMP,
       approved_at TEXT
     );" >/dev/null 2>&1 || true
+
+  # Campos extra (pagos MP + QR) – no rompe instalaciones anteriores
+  for coldef in "payment_url TEXT" "qr_path TEXT" "mp_payment_id TEXT" "mp_status_detail TEXT" "delivered INTEGER DEFAULT 0"; do
+    col="${coldef%% *}"
+    if ! sqlite3 "$DB_FILE" "PRAGMA table_info(payments);" 2>/dev/null | awk -F'|' '{print $2}' | grep -qx "$col"; then
+      sqlite3 "$DB_FILE" "ALTER TABLE payments ADD COLUMN $coldef;" >/dev/null 2>&1 || true
+    fi
+  done
 }
 
 pm2_status() {
@@ -1388,8 +1837,7 @@ show_qr_png() {
     echo -e "${GREEN}✅ PNG guardado: $QR_PNG${NC}"
     if need_cmd chafa; then
       chafa -s 70x40 "$QR_PNG" 2>/dev/null || true
-    elif need_cmd viu; then
-      viu -w 60 "$QR_PNG" 2>/dev/null || true
+    elif need_cmd ; then -w 60 "$QR_PNG" 2>/dev/null || true
     else
       echo -e "${YELLOW}No hay visor en terminal. Abrilo manualmente: ls -lah $QR_PNG${NC}"
     fi
@@ -2034,6 +2482,72 @@ ajustes_menu() {
   done
 }
 
+
+transfer_menu() {
+  while true; do
+    header "🏦 Transferencias"
+    echo "Datos actuales para recibir transferencias:"
+    echo "  Titular : $(cfg '.transfer.titular')"
+    echo "  Alias   : $(cfg '.transfer.alias')"
+    echo "  CBU     : $(cfg '.transfer.cbu')"
+    echo "  Admin WA: $(cfg '.transfer.admin_whatsapp')"
+    echo ""
+    echo "[1] ✏️  Editar datos (Titular/Alias/CBU)"
+    echo "[2] 📲 Editar número admin WhatsApp (para confirmar)"
+    echo "[3] 📋 Ver pagos pendientes (Transferencia)"
+    echo "[4] ✅ Confirmar pago (por REF)"
+    echo "[5] ❌ Rechazar / borrar pago (por REF)"
+    echo "[0] ↩️  Volver"
+    read -rp "Opción: " op
+    case "$op" in
+      1)
+        read -rp "Titular (Nombre y Apellido): " titular
+        read -rp "Alias: " alias
+        read -rp "CBU: " cbu
+        [[ -n "$titular" ]] && set_cfg '.transfer.titular' ""$titular""
+        [[ -n "$alias" ]] && set_cfg '.transfer.alias' ""$alias""
+        [[ -n "$cbu" ]] && set_cfg '.transfer.cbu' ""$cbu""
+        ok "Datos actualizados."
+        pause
+        ;;
+      2)
+        echo "Formato: solo números con código país (ej: 5491122334455)"
+        read -rp "Número admin WhatsApp: " nwa
+        nwa="$(echo "$nwa" | tr -cd '0-9')"
+        [[ -n "$nwa" ]] && set_cfg '.transfer.admin_whatsapp' ""$nwa""
+        ok "Número admin actualizado."
+        pause
+        ;;
+      3)
+        header "📋 Pagos pendientes - Transferencias"
+        ensure_db
+        sqlite3 -header -column "$DB" "SELECT external_reference AS REF, substr(phone,1,15) AS TEL, plan AS PLAN, app_type AS APP, amount AS MONTO, status AS ESTADO, created_at AS FECHA FROM payments WHERE method='transfer' AND status='pending_admin' ORDER BY id DESC LIMIT 50;" 2>/dev/null || true
+        echo ""
+        echo "Tip: confirmá desde [4] con la REF."
+        pause
+        ;;
+      4)
+        ensure_db
+        read -rp "REF a confirmar: " ref
+        [[ -z "$ref" ]] && continue
+        sqlite3 "$DB" "UPDATE payments SET status='approved', approved_at=datetime('now') WHERE external_reference='$ref' AND method='transfer' AND status='pending_admin';" 2>/dev/null || true
+        ok "Marcado como APPROVED. El bot entregará automáticamente en 1-2 min."
+        pause
+        ;;
+      5)
+        ensure_db
+        read -rp "REF a rechazar/borrar: " ref
+        [[ -z "$ref" ]] && continue
+        sqlite3 "$DB" "UPDATE payments SET status='rejected' WHERE external_reference='$ref' AND method='transfer' AND status='pending_admin';" 2>/dev/null || true
+        ok "Marcado como REJECTED."
+        pause
+        ;;
+      0) return ;;
+      *) warn "Opción inválida"; sleep 1 ;;
+    esac
+  done
+}
+
 ajustar_soporte() {
   ensure_config
   local sup wa tg tut
@@ -2180,6 +2694,7 @@ main_menu() {
       10) migrar_usuario_a_token ;;
       11) update_menu ;;
       12) ajustes_menu ;;
+      13) transfer_menu ;;
       0) exit 0 ;;
       *) echo -e "${RED}❌ Opción inválida${NC}"; sleep 1 ;;
     esac
